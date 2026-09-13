@@ -1,0 +1,54 @@
+name: Coin Hunter Scan
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: coin-hunter-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: coin_hunter.db
+          key: coin-hunter-db-${{ github.run_id }}
+          restore-keys: |
+            coin-hunter-db-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MORALIS_API_KEY: ${{ secrets.MORALIS_API_KEY }}
+        run: python main.py
+
+      - name: Commit updated signals JSON
+        run: |
+          git config user.name "coin-hunter-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add latest_signals.json
+          git diff --staged --quiet || git commit -m "chore: update latest_signals.json [skip ci]"
+          git push
