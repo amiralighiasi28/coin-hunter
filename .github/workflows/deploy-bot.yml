@@ -1,0 +1,31 @@
+name: Deploy Telegram Bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "telegram_bot/**"
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: telegram_bot
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Telegram Serverless CLI
+        run: npm install -g @tgcloud/cli
+
+      - name: Deploy to Telegram Serverless
+        env:
+          TGCLOUD_TOKEN: ${{ secrets.TGCLOUD_TOKEN }}
+        run: tgcloud push --force
