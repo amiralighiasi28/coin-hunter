@@ -125,6 +125,20 @@ class DexScreenerClient:
         chain_id_str = pair.get("chainId")
         chain_info = config.DEXSCREENER_CHAIN_MAP.get(chain_id_str, {})
 
+        # اطلاعات تکمیلی (وب‌سایت/توییتر) اگه سازنده‌ی توکن ثبت کرده باشه -
+        # DexScreener این‌ها رو تو فیلد info برمی‌گردونه (اختیاریه، همیشه نیست)
+        info = pair.get("info") or {}
+        website_url = None
+        for w in info.get("websites") or []:
+            if w.get("url"):
+                website_url = w["url"]
+                break
+        twitter_url = None
+        for s in info.get("socials") or []:
+            if s.get("type") == "twitter" and s.get("url"):
+                twitter_url = s["url"]
+                break
+
         return {
             "coin_id": f"dex-{base_token.get('address', pair.get('pairAddress'))}",
             "symbol": (base_token.get("symbol") or "?").upper(),
@@ -146,5 +160,12 @@ class DexScreenerClient:
             "chain_type": chain_info.get("chain_type"),
             "goplus_chain_id": chain_info.get("goplus_chain_id"),
             "contract_address": base_token.get("address"),
+            # dex_chain همیشه اسم چین خام DexScreener‌ه (برای ساخت لینک) -
+            # برخلاف "source" که ممکنه بعداً به چیز دیگه‌ای بازنویسی بشه
+            # (مثلاً "pumpfun_graduate")
+            "dex_chain": chain_id_str,
+            "website_url": website_url,
+            "twitter_url": twitter_url,
             "source": chain_id_str or "dexscreener",
         }
+        
