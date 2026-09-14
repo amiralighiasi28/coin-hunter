@@ -107,3 +107,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # فقط کوین‌هایی که امتیاز نهایی‌شون از این بیشتره نوتیفیکیشن می‌گیرن
 NOTIFY_MIN_SCORE = 60.0
+# بعد از اینکه یه کوین نوتیفیکیشن گرفت، تا این تعداد ساعت دوباره براش پیام
+# نمی‌فرستیم حتی اگه همچنان واجد شرایط باشه - جلوگیری از اسپم شدن هر ۱۰ دقیقه
+NOTIFY_COOLDOWN_HOURS = 6
