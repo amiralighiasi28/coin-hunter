@@ -27,7 +27,7 @@ class TelegramNotifier:
         self.chat_id = chat_id or config.TELEGRAM_CHAT_ID
         self.enabled = bool(self.token and self.chat_id)
 
-    def send_message(self, text: str) -> bool:
+    def send_message(self, text: str, use_markdown: bool = False) -> bool:
         """یک پیام متنی به چت مشخص‌شده می‌فرسته. اگه توکن/چت‌آیدی ست نشده باشه، فقط False برمی‌گردونه."""
         if not self.enabled:
             return False
@@ -38,6 +38,8 @@ class TelegramNotifier:
             "text": text,
             "disable_web_page_preview": True,
         }
+        if use_markdown:
+            payload["parse_mode"] = "Markdown"
         try:
             resp = requests.post(url, data=payload, timeout=15)
             resp.raise_for_status()
@@ -46,15 +48,47 @@ class TelegramNotifier:
             print(f"خطا در ارسال پیام تلگرام: {e}")
             return False
 
+    @staticmethod
+    def _escape_markdown(text: str) -> str:
+        """کاراکترهای خاص Markdown (که می‌تونن فرمت پیام رو خراب کنن) رو از متن آزاد (اسم/نماد کوین) حذف می‌کنه."""
+        if not text:
+            return text
+        for ch in ["*", "_", "`", "["]:
+            text = text.replace(ch, "")
+        return text
+
+    def _build_explorer_link(self, coin: dict) -> str:
+        """
+        لینک درست برای دیدن کوین می‌سازه. برای کوین‌های DexScreener/Pump.fun
+        (که تو CoinGecko لیست نیستن) از لینک DexScreener استفاده می‌کنه که
+        همیشه با chain+آدرس قرارداد کار می‌کنه؛ فقط برای کوین‌های خام CoinGecko
+        از لینک coingecko استفاده می‌شه.
+        """
+        dex_chain = coin.get("dex_chain")
+        address = coin.get("contract_address")
+        if dex_chain and address:
+            return f"https://dexscreener.com/{dex_chain}/{address}"
+        if not address:
+            return f"https://www.coingecko.com/en/coins/{coin['coin_id']}"
+        return f"https://dexscreener.com/search?q={address}"
+
     def format_signal_message(self, coin: dict) -> str:
-        """پیام قابل‌خوندن برای یک سیگنال کوین می‌سازه (بدون فرمت خاص، پرهیز از دردسر escape کردن Markdown)."""
+        """
+        پیام قابل‌خوندن برای یک سیگنال کوین می‌سازه. از Markdown سبک استفاده
+        می‌کنه فقط برای کد قابل‌کپی‌کردن آدرس قرارداد؛ بقیه‌ی متن آزاد
+        (اسم/نماد) قبلش پاک‌سازی می‌شه تا فرمت پیام خراب نشه.
+        """
         risk = coin.get("risk", {})
         tier = coin.get("tier", {})
+        symbol = coin.get("symbol", "?")
+        name = coin.get("name", "-")
+        address = coin.get("contract_address")
+
         lines = [
             f"{tier.get('emoji', '🚨')} سیگنال جدید شکار کوین [رده {tier.get('tier', '?')}]",
             "",
-            f"نماد: {coin['symbol']}",
-            f"نام: {coin.get('name', '-')}",
+            f"نماد: #{symbol}",
+            f"نام: {name}",
             f"رده: {tier.get('label', '-')}",
             f"امتیاز نهایی: {coin['final_score']} / 100",
             f"مارکت‌کپ: ${coin['market_cap_usd']:,.0f}",
@@ -69,10 +103,30 @@ class TelegramNotifier:
             lines.append(f"هشدارها: {' | '.join(risk['warning_flags'])}")
         lines.append(f"توضیح رده: {tier.get('explanation', '-')}")
         lines.append("")
-        lines.append(f"لینک: https://www.coingecko.com/en/coins/{coin['coin_id']}")
+
+        if address:
+            lines.append(f"کانترکت: {address}")
+
+        lines.append(f"لینک: {self._build_explorer_link(coin)}")
+        if coin.get("twitter_url"):
+            lines.append(f"توییتر: {coin['twitter_url']}")
+        if coin.get("website_url"):
+            lines.append(f"وبسایت: {coin['website_url']}")
+
         lines.append("")
         lines.append("⚠️ این توصیه‌ی خرید نیست. فقط یک فیلتر آماریه. با سرمایه‌ی مازاد و حجم کم تصمیم بگیر.")
         return "\n".join(lines)
+
+    def format_contract_only_message(self, coin: dict) -> str:
+        """
+        یه پیام جداگانه‌ی خیلی کوتاه، فقط شامل آدرس قرارداد با فرمت کد -
+        تو تلگرام این باعث می‌شه با یه لمس کپی بشه. جدا از پیام اصلی فرستاده
+        می‌شه تا خطر شکستن فرمت (به‌خاطر کاراکترهای خاص تو بقیه‌ی متن) صفر باشه.
+        """
+        address = coin.get("contract_address")
+        if not address:
+            return ""
+        return f"`{address}`"
 
     def notify_signals(self, coins: list[dict]):
         """
@@ -91,5 +145,9 @@ class TelegramNotifier:
             if not database.should_notify(coin["coin_id"], config.NOTIFY_COOLDOWN_HOURS):
                 continue
             msg = self.format_signal_message(coin)
-            if self.send_message(msg):
+            if self.send_message(msg, use_markdown=False):
                 database.record_notification(coin["coin_id"])
+                contract_msg = self.format_contract_only_message(coin)
+                if contract_msg:
+                    self.send_message(contract_msg, use_markdown=True)
+              
