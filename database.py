@@ -75,6 +75,12 @@ def init_db():
                 status TEXT DEFAULT 'active'
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notification_log (
+                coin_id TEXT PRIMARY KEY,
+                last_notified_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 
@@ -213,4 +219,35 @@ def expire_old_watchlist_entries(max_age_days: int = 30):
             UPDATE watchlist SET status = 'expired'
             WHERE status = 'active' AND first_seen_at < ?
         """, (cutoff,))
+        conn.commit()
+
+
+def should_notify(coin_id: str, cooldown_hours: float) -> bool:
+    """
+    فاز ۴ - جلوگیری از اسپم: چک می‌کنه آیا این کوین در بازه‌ی cooldown اخیر
+    (مثلاً ۶ ساعت) قبلاً نوتیفیکیشن گرفته یا نه. اگه گرفته، دوباره نمی‌فرستیم
+    حتی اگه همچنان واجد شرایط باشه (وگرنه هر ۱۰ دقیقه دوباره پیام می‌ره).
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT last_notified_at FROM notification_log WHERE coin_id = ?",
+            (coin_id,),
+        ).fetchone()
+        if row is None:
+            return True
+        last_notified = datetime.fromisoformat(row["last_notified_at"])
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+        return last_notified < cutoff
+
+
+def record_notification(coin_id: str):
+    """بعد از ارسال موفق پیام، زمانش رو ثبت می‌کنه تا should_notify جلوی تکرار رو بگیره."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO notification_log (coin_id, last_notified_at)
+            VALUES (?, ?)
+            ON CONFLICT(coin_id) DO UPDATE SET last_notified_at = excluded.last_notified_at
+        """, (coin_id, now))
+        conn.commit()
         conn.commit()
