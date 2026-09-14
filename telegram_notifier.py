@@ -16,6 +16,7 @@ cron-based مثل GitHub Actions (که اسکریپت اجرا و بلافاصل
 
 import requests
 import config
+import database
 
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
 
@@ -74,7 +75,11 @@ class TelegramNotifier:
         return "\n".join(lines)
 
     def notify_signals(self, coins: list[dict]):
-        """روی لیست کوین‌های واجد شرایط پیمایش می‌کنه و برای هرکدوم پیام می‌فرسته."""
+        """
+        روی لیست کوین‌های واجد شرایط پیمایش می‌کنه و برای هرکدوم پیام می‌فرسته.
+        قبل از ارسال چک می‌کنه که این کوین اخیراً (تو بازه‌ی cooldown) نوتیفیکیشن
+        نگرفته باشه - وگرنه هر اجرا (هر ۱۰ دقیقه) دوباره همون کوین رو گزارش می‌ده.
+        """
         if not self.enabled:
             print("توکن/چت‌آیدی تلگرام ست نشده - نوتیفیکیشن رد شد (فقط در کنسول چاپ می‌شه).")
             return
@@ -83,5 +88,8 @@ class TelegramNotifier:
                 continue
             if coin.get("tier", {}).get("tier") == "REJECTED":
                 continue
+            if not database.should_notify(coin["coin_id"], config.NOTIFY_COOLDOWN_HOURS):
+                continue
             msg = self.format_signal_message(coin)
-            self.send_message(msg)
+            if self.send_message(msg):
+                database.record_notification(coin["coin_id"])
