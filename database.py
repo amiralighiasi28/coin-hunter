@@ -81,6 +81,28 @@ def init_db():
                 last_notified_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracked_outcomes (
+                coin_id TEXT PRIMARY KEY,
+                symbol TEXT,
+                name TEXT,
+                dex_chain TEXT,
+                contract_address TEXT,
+                signal_price_usd REAL,
+                signal_market_cap_usd REAL,
+                signal_final_score REAL,
+                signal_tier TEXT,
+                signal_at TEXT NOT NULL,
+                peak_price_usd REAL,
+                peak_multiplier REAL,
+                peak_at TEXT,
+                last_price_usd REAL,
+                last_checked_at TEXT,
+                hit_target INTEGER DEFAULT 0,
+                hit_target_at TEXT,
+                status TEXT DEFAULT 'tracking'
+            )
+        """)
         conn.commit()
 
 
@@ -250,4 +272,140 @@ def record_notification(coin_id: str):
             ON CONFLICT(coin_id) DO UPDATE SET last_notified_at = excluded.last_notified_at
         """, (coin_id, now))
         conn.commit()
+
+
+# ============================================================
+# رصد نتیجه (Outcome Tracking)
+# هدف: برای هر کوینی که یه بار سیگنال دادیم، قیمت لحظه‌ی سیگنال رو ثبت
+# می‌کنیم و هر اجرا دوباره قیمت فعلی رو چک می‌کنیم تا در پایان (مثلاً روز
+# دهم) دقیق بدونیم چند درصد از سیگنال‌های ما واقعاً به ۱۰۰۰%+ رسیدن.
+# ============================================================
+
+def start_tracking(coin: dict):
+    """
+    اولین باری که یه کوین واجد شرایط (S/A/B، نه رد‌شده) شناسایی می‌شه،
+    قیمتش رو به‌عنوان خط مبنا ثبت می‌کنه. اگه قبلاً برای این کوین شروع به
+    رصد کرده باشیم، هیچ کاری نمی‌کنه (INSERT OR IGNORE) - چون خط مبنا باید
+    همیشه همون اولین لحظه‌ی شناسایی باشه، نه هر بار که دوباره می‌بینیمش.
+    """
+    price = coin.get("price_usd")
+    if not price or price <= 0:
+        return  # بدون قیمت معتبر نمی‌شه رصد کرد
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO tracked_outcomes
+            (coin_id, symbol, name, dex_chain, contract_address,
+             signal_price_usd, signal_market_cap_usd, signal_final_score,
+             signal_tier, signal_at, peak_price_usd, peak_multiplier,
+             peak_at, last_price_usd, last_checked_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'tracking')
+        """, (
+            coin["coin_id"], coin.get("symbol"), coin.get("name"),
+            coin.get("dex_chain"), coin.get("contract_address"),
+            price, coin.get("market_cap_usd"), coin.get("final_score"),
+            coin.get("tier", {}).get("tier"), now,
+            price, 1.0, now, price, now,
+        ))
         conn.commit()
+
+
+def get_active_tracked(max_age_days: int):
+    """کوین‌هایی که هنوز تو بازه‌ی رصد (مثلاً ۳۰ روز) هستن و به هدف نرسیدن."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT * FROM tracked_outcomes
+            WHERE status = 'tracking' AND signal_at >= ?
+        """, (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_tracked_price(coin_id: str, current_price: float, hit_multiplier: float) -> bool:
+    """
+    قیمت فعلی رو برای یه کوین در حال رصد به‌روزرسانی می‌کنه، peak رو اگه لازم
+    بود بالا می‌بره، و اگه به آستانه‌ی هدف (مثلاً ۱۱x = رشد ۱۰۰۰%) رسیده باشه
+    hit_target رو ست می‌کنه.
+    خروجی: True اگه همین الان (برای اولین بار) به هدف رسیده باشه (برای اینکه
+    main.py بتونه یه پیام تبریک/اعلان بفرسته).
+    """
+    if not current_price or current_price <= 0:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tracked_outcomes WHERE coin_id = ?", (coin_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        row = dict(row)
+
+        signal_price = row["signal_price_usd"] or 0
+        if signal_price <= 0:
+            return False
+        multiplier = current_price / signal_price
+
+        just_hit = False
+        peak_price = row["peak_price_usd"] or signal_price
+        peak_multiplier = row["peak_multiplier"] or 1.0
+        peak_at = row["peak_at"]
+        if current_price > peak_price:
+            peak_price = current_price
+            peak_multiplier = multiplier
+            peak_at = now
+
+        already_hit = bool(row["hit_target"])
+        new_hit_target = already_hit or multiplier >= hit_multiplier
+        hit_target_at = row["hit_target_at"]
+        if new_hit_target and not already_hit:
+            just_hit = True
+            hit_target_at = now
+
+        conn.execute("""
+            UPDATE tracked_outcomes SET
+                last_price_usd = ?, last_checked_at = ?,
+                peak_price_usd = ?, peak_multiplier = ?, peak_at = ?,
+                hit_target = ?, hit_target_at = ?
+            WHERE coin_id = ?
+        """, (
+            current_price, now, peak_price, peak_multiplier, peak_at,
+            1 if new_hit_target else 0, hit_target_at, coin_id,
+        ))
+        conn.commit()
+        return just_hit
+
+
+def expire_old_tracked(max_age_days: int):
+    """کوین‌هایی که از بازه‌ی رصد (مثلاً ۳۰ روز) رد شدن و به هدف نرسیدن رو 'expired' علامت می‌زنه."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE tracked_outcomes SET status = 'expired'
+            WHERE status = 'tracking' AND signal_at < ?
+        """, (cutoff,))
+        conn.commit()
+
+
+def get_tracking_stats() -> dict:
+    """
+    آمار کلی برای گزارش بک‌تست: چند تا سیگنال داده شده، چندتاشون به هدف
+    (۱۰۰۰%+) رسیدن، و لیست کامل برای بررسی دستی.
+    """
+    with get_connection() as conn:
+        all_rows = conn.execute("SELECT * FROM tracked_outcomes").fetchall()
+        all_rows = [dict(r) for r in all_rows]
+
+    total = len(all_rows)
+    hits = [r for r in all_rows if r["hit_target"]]
+    still_tracking = [r for r in all_rows if r["status"] == "tracking"]
+    expired_no_hit = [r for r in all_rows if r["status"] == "expired" and not r["hit_target"]]
+
+    return {
+        "total_signals": total,
+        "hit_count": len(hits),
+        "hit_rate_percent": round((len(hits) / total) * 100, 1) if total else 0.0,
+        "still_tracking_count": len(still_tracking),
+        "expired_without_hit_count": len(expired_no_hit),
+        "hits": sorted(hits, key=lambda r: r["peak_multiplier"] or 0, reverse=True),
+        "all": all_rows,
+    }
