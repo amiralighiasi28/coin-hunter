@@ -63,11 +63,94 @@ def resolve_coin_chain(client: CoinGeckoClient, coin: dict):
     return resolve_chain(platforms)
 
 
+def refresh_outcome_tracking(client: CoinGeckoClient, dex_client: DexScreenerClient, notifier: TelegramNotifier):
+    """
+    فاز رصد نتیجه: قیمت فعلی همه‌ی کوین‌هایی که قبلاً بهشون سیگنال دادیم رو
+    می‌گیره و با قیمت لحظه‌ی سیگنال مقایسه می‌کنه. اگه کوینی برای اولین بار
+    به هدف (پیش‌فرض ۱۰۰۰% رشد) رسیده باشه، یه پیام تبریک/اعلان جداگانه
+    می‌فرسته. این دقیقاً داده‌ای هست که برای بک‌تست روز دهم لازم داریم.
+    """
+    print()
+    print("فاز رصد نتیجه: بررسی عملکرد سیگنال‌های قبلی ...")
+    try:
+        database.expire_old_tracked(config.OUTCOME_TRACKING_MAX_DAYS)
+        tracked = database.get_active_tracked(config.OUTCOME_TRACKING_MAX_DAYS)
+        print(f"تعداد {len(tracked)} سیگنال در حال رصد (کمتر از {config.OUTCOME_TRACKING_MAX_DAYS} روز).")
+        if not tracked:
+            return
+
+        with_contract = [t for t in tracked if t.get("contract_address")]
+        coingecko_only = [t for t in tracked if not t.get("contract_address")]
+
+        # قیمت فعلی کوین‌های دارای قرارداد (DexScreener/Pump.fun) - بین چند
+        # pair احتمالی برای یک آدرس، اون با بیشترین نقدینگی رو معتبرتر می‌دونیم
+        price_map = {}
+        if with_contract:
+            addresses = list({t["contract_address"] for t in with_contract})
+            pairs = dex_client.get_pairs_for_tokens(addresses)
+            liq_map = {}
+            for pair in pairs:
+                addr = (pair.get("baseToken") or {}).get("address")
+                if not addr:
+                    continue
+                try:
+                    price = float(pair.get("priceUsd") or 0)
+                except (TypeError, ValueError):
+                    continue
+                liquidity = (pair.get("liquidity") or {}).get("usd") or 0
+                if addr not in liq_map or liquidity > liq_map[addr]:
+                    liq_map[addr] = liquidity
+                    price_map[addr] = price
+
+        cg_price_map = {}
+        if coingecko_only:
+            ids = [t["coin_id"] for t in coingecko_only]
+            markets = client.fetch_markets_by_ids(ids)
+            for raw in markets:
+                cg_price_map[raw.get("id")] = raw.get("current_price")
+
+        newly_hit = []
+        for t in tracked:
+            if t.get("contract_address"):
+                current_price = price_map.get(t["contract_address"])
+            else:
+                current_price = cg_price_map.get(t["coin_id"])
+            if current_price is None:
+                continue
+            just_hit = database.update_tracked_price(
+                t["coin_id"], current_price, config.OUTCOME_HIT_MULTIPLIER
+            )
+            if just_hit:
+                newly_hit.append((t, current_price))
+
+        for t, current_price in newly_hit:
+            signal_price = t["signal_price_usd"] or 0
+            multiplier = (current_price / signal_price) if signal_price else 0
+            growth_percent = (multiplier - 1) * 100
+            msg = (
+                "🎯 یک سیگنال قبلی به هدف رسید!\n\n"
+                f"نماد: #{t['symbol']}\n"
+                f"رشد از لحظه‌ی سیگنال: {growth_percent:.0f}%\n"
+                f"تاریخ سیگنال: {t['signal_at'][:10]}\n"
+                f"قیمت سیگنال: ${signal_price:.10f}\n"
+                f"قیمت الان: ${current_price:.10f}"
+            )
+            notifier.send_to_all(msg, use_html=False)
+
+        if newly_hit:
+            print(f"🎯 {len(newly_hit)} سیگنال تازه به هدف {config.OUTCOME_HIT_MULTIPLIER}x رسید!")
+    except Exception as e:
+        print(f"خطا در رصد نتیجه: {e}", file=sys.stderr)
+
+
 def run_once():
     print("=" * 60)
     client = CoinGeckoClient()
     dex_client = DexScreenerClient()
+    notifier = TelegramNotifier()
     normalized = []
+
+    refresh_outcome_tracking(client, dex_client, notifier)
 
     # --- فاز ۱: میکروکپ CoinGecko ---
     print("فاز ۱: دریافت کوین‌های میکروکپ از CoinGecko ...")
@@ -249,6 +332,10 @@ def run_once():
                 database.upsert_watchlist(result_coin, final_score)
             except Exception as e:
                 print(f"خطا در به‌روزرسانی واچ‌لیست: {e}", file=sys.stderr)
+            try:
+                database.start_tracking(result_coin)
+            except Exception as e:
+                print(f"خطا در شروع رصد نتیجه: {e}", file=sys.stderr)
 
     final_results.sort(key=lambda c: c["final_score"], reverse=True)
 
@@ -300,7 +387,6 @@ def run_once():
 
     print()
     print("فاز ۴: ارسال اعلان تلگرام برای سیگنال‌های واجد شرایط ...")
-    notifier = TelegramNotifier()
     qualifying = [c for c in final_results if c["tier"]["tier"] != "REJECTED"]
     notifier.notify_signals(qualifying)
     if notifier.enabled:
